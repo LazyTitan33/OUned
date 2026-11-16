@@ -267,57 +267,87 @@ class ADDCOMPUTER:
 
     def LDAP3KerberosLogin(self, connection, user, password, domain='', lmhash='', nthash='', aesKey='', kdcHost=None, TGT=None,
                       TGS=None, useCache=True):
+        """Bind to LDAPS using Kerberos/SPNEGO with TLS channel binding.
+
+        The channel-binding token is derived from the certificate presented by
+        the LDAPS server. This is required by domain controllers enforcing
+        LDAP channel-binding validation (for example, SEC_E_BAD_BINDINGS /
+        LDAP error data 80090346).
+        """
         from pyasn1.codec.ber import encoder, decoder
         from pyasn1.type.univ import noValue
-        """
-        logins into the target system explicitly using Kerberos. Hashes are used if RC4_HMAC is supported.
-
-        :param string user: username
-        :param string password: password for the user
-        :param string domain: domain where the account is valid for (required)
-        :param string lmhash: LMHASH used to authenticate using hashes (password is not used)
-        :param string nthash: NTHASH used to authenticate using hashes (password is not used)
-        :param string aesKey: aes256-cts-hmac-sha1-96 or aes128-cts-hmac-sha1-96 used for Kerberos authentication
-        :param string kdcHost: hostname or IP Address for the KDC. If None, the domain will be used (it needs to resolve tho)
-        :param struct TGT: If there's a TGT available, send the structure here and it will be used
-        :param struct TGS: same for TGS. See smb3.py for the format
-        :param bool useCache: whether or not we should use the ccache for credentials lookup. If TGT or TGS are specified this is False
-
-        :return: True, raises an Exception if error.
-        """
+        from impacket.krb5.ccache import CCache
+        from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
+        from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS, CheckSumField
+        from impacket.krb5.gssapi import GSS_C_SEQUENCE_FLAG, GSS_C_REPLAY_FLAG
+        from impacket.krb5 import constants
+        from impacket.krb5.types import Principal, KerberosTime, Ticket
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from hashlib import md5
+        import datetime
 
         if lmhash != '' or nthash != '':
             if len(lmhash) % 2:
                 lmhash = '0' + lmhash
             if len(nthash) % 2:
                 nthash = '0' + nthash
-            try:  # just in case they were converted already
+            try:
                 lmhash = unhexlify(lmhash)
                 nthash = unhexlify(nthash)
             except TypeError:
                 pass
 
-        # Importing down here so pyasn1 is not required if kerberos is not used.
-        from impacket.krb5.ccache import CCache
-        from impacket.krb5.asn1 import AP_REQ, Authenticator, TGS_REP, seq_set
-        from impacket.krb5.kerberosv5 import getKerberosTGT, getKerberosTGS
-        from impacket.krb5 import constants
-        from impacket.krb5.types import Principal, KerberosTime, Ticket
-        import datetime
-
         if TGT is not None or TGS is not None:
             useCache = False
+
+        # Open LDAPS first: the TLS peer certificate is needed to calculate
+        # the tls-server-end-point channel-binding value.
+        if connection.closed:
+            connection.open(read_server_info=False)
+
+        try:
+            peer_cert_der = connection.socket.getpeercert(binary_form=True)
+        except Exception as e:
+            raise Exception('Unable to read the LDAPS server certificate for channel binding: %s' % e)
+        if not peer_cert_der:
+            raise Exception('The LDAPS connection did not provide a peer certificate; cannot calculate channel binding.')
+
+        try:
+            peer_cert = x509.load_der_x509_certificate(peer_cert_der)
+            hash_algorithm = peer_cert.signature_hash_algorithm
+            if hash_algorithm is None:
+                raise Exception('The server certificate has no supported signature hash algorithm.')
+            # RFC 5929: use SHA-256 when the certificate signature uses MD5 or SHA-1.
+            if isinstance(hash_algorithm, (hashes.MD5, hashes.SHA1)):
+                hash_algorithm = hashes.SHA256()
+            cert_hasher = hashes.Hash(hash_algorithm)
+            cert_hasher.update(peer_cert_der)
+            cert_digest = cert_hasher.finalize()
+        except Exception as e:
+            raise Exception('Unable to calculate the LDAPS TLS channel binding: %s' % e)
+
+        # GSS channel bindings: zero initiator/acceptor address fields followed
+        # by the length-prefixed tls-server-end-point application data.
+        application_data = b'tls-server-end-point:' + cert_digest
+        channel_binding_data = (
+            b'\x00' * 8 +
+            b'\x00' * 8 +
+            len(application_data).to_bytes(4, byteorder='little') +
+            application_data
+        )
+        channel_binding_hash = md5(channel_binding_data).digest()
 
         targetName = 'ldap/%s' % self.__target
         if useCache:
             domain, user, TGT, TGS = CCache.parseFile(domain, user, targetName)
 
-        # First of all, we need to get a TGT for the user
         userName = Principal(user, type=constants.PrincipalNameType.NT_PRINCIPAL.value)
         if TGT is None:
             if TGS is None:
-                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(userName, password, domain, lmhash, nthash,
-                                                                        aesKey, kdcHost)
+                tgt, cipher, oldSessionKey, sessionKey = getKerberosTGT(
+                    userName, password, domain, lmhash, nthash, aesKey, kdcHost
+                )
         else:
             tgt = TGT['KDC_REP']
             cipher = TGT['cipher']
@@ -325,73 +355,68 @@ class ADDCOMPUTER:
 
         if TGS is None:
             serverName = Principal(targetName, type=constants.PrincipalNameType.NT_SRV_INST.value)
-            tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(serverName, domain, kdcHost, tgt, cipher,
-                                                                    sessionKey)
+            tgs, cipher, oldSessionKey, sessionKey = getKerberosTGS(
+                serverName, domain, kdcHost, tgt, cipher, sessionKey
+            )
         else:
             tgs = TGS['KDC_REP']
             cipher = TGS['cipher']
             sessionKey = TGS['sessionKey']
 
-            # Let's build a NegTokenInit with a Kerberos REQ_AP
-
         blob = SPNEGO_NegTokenInit()
-
-        # Kerberos
         blob['MechTypes'] = [TypesMech['MS KRB5 - Microsoft Kerberos 5']]
 
-        # Let's extract the ticket from the TGS
         tgs = decoder.decode(tgs, asn1Spec=TGS_REP())[0]
         ticket = Ticket()
         ticket.from_asn1(tgs['ticket'])
 
-        # Now let's build the AP_REQ
         apReq = AP_REQ()
         apReq['pvno'] = 5
         apReq['msg-type'] = int(constants.ApplicationTagNumbers.AP_REQ.value)
-
-        opts = []
-        apReq['ap-options'] = constants.encodeFlags(opts)
+        apReq['ap-options'] = constants.encodeFlags([])
         seq_set(apReq, 'ticket', ticket.to_asn1)
 
         authenticator = Authenticator()
         authenticator['authenticator-vno'] = 5
         authenticator['crealm'] = domain
         seq_set(authenticator, 'cname', userName.components_to_asn1)
-        now = datetime.datetime.utcnow()
-
+        now = datetime.datetime.now(datetime.timezone.utc)
         authenticator['cusec'] = now.microsecond
         authenticator['ctime'] = KerberosTime.to_asn1(now)
 
+        # GSS-API checksum (type 0x8003), including the LDAPS CBT hash.
+        authenticator['cksum'] = noValue
+        authenticator['cksum']['cksumtype'] = 0x8003
+        checksum_field = CheckSumField()
+        checksum_field['Lgth'] = 16
+        checksum_field['Flags'] = GSS_C_SEQUENCE_FLAG | GSS_C_REPLAY_FLAG
+        checksum_field['Bnd'] = channel_binding_hash
+        authenticator['cksum']['checksum'] = checksum_field.getData()
+        authenticator['seq-number'] = 0
+
         encodedAuthenticator = encoder.encode(authenticator)
-
-        # Key Usage 11
-        # AP-REQ Authenticator (includes application authenticator
-        # subkey), encrypted with the application session key
-        # (Section 5.5.1)
         encryptedEncodedAuthenticator = cipher.encrypt(sessionKey, 11, encodedAuthenticator, None)
-
         apReq['authenticator'] = noValue
         apReq['authenticator']['etype'] = cipher.enctype
         apReq['authenticator']['cipher'] = encryptedEncodedAuthenticator
-
         blob['MechToken'] = encoder.encode(apReq)
 
-
-        request = ldap3.operation.bind.bind_operation(connection.version, ldap3.SASL, user, None, 'GSS-SPNEGO', blob.getData())
-
-        # Done with the Kerberos saga, now let's get into LDAP
-        # try to open connection if closed
-        if connection.closed:
-            connection.open(read_server_info=False)
+        request = ldap3.operation.bind.bind_operation(
+            connection.version, ldap3.SASL, user, None, 'GSS-SPNEGO', blob.getData()
+        )
 
         connection.sasl_in_progress = True
-        response = connection.post_send_single_response(connection.send('bindRequest', request, None))
-        connection.sasl_in_progress = False
-        if response[0]['result'] != 0:
+        try:
+            response = connection.post_send_single_response(
+                connection.send('bindRequest', request, None)
+            )
+        finally:
+            connection.sasl_in_progress = False
+
+        if not response or response[0]['result'] != 0:
             raise Exception(response)
 
         connection.bound = True
-
         return True
 
     def generateComputerName(self):
